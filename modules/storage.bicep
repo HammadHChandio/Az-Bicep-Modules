@@ -9,6 +9,10 @@ param accessConnectorPrincipalId string
 
 param privateEndpointSubnetId string
 
+
+@description('Databricks container name')
+param containerName string = 'databricks'
+
 resource storageAccount 'Microsoft.Storage/storageAccounts@2023-01-01' = {
   name: name
   location: location
@@ -57,7 +61,7 @@ resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-01-01'
 
 resource databricksContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-01-01' = {
   parent: blobService
-  name: 'databricks'
+  name: containerName
   properties: {
     publicAccess: 'None'
   }

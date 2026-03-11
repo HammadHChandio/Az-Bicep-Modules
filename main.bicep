@@ -52,6 +52,8 @@ param publicNetworkAccess string = 'Disabled'
 ])
 param workspaceSku string = 'premium'
 
+@description('Databricks container name')
+param containerName string = 'databricks'
 var managedResourceGroupName = '${databricksName}-managed-rg'
 
 resource vnet 'Microsoft.Network/virtualNetworks@2023-09-01' existing = {
@@ -245,9 +247,6 @@ module databricks './modules/databricks.bicep' = {
   }
   dependsOn: [
     accessConnector
-    keyVault
-    managedServicesKey
-    managedDiskKey
     keyVaultRoleAssignment
   ]
 }
@@ -286,6 +285,7 @@ module storage './modules/storage.bicep' = {
     storageKeyVersion: storageKeyVersion
     accessConnectorPrincipalId: accessConnector.outputs.principalId
     privateEndpointSubnetId: privateEndpointSubnet.id
+    containerName: containerName
   }
   dependsOn: [
     keyVaultRoleAssignment
