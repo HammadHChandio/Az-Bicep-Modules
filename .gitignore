@@ -1,0 +1,23 @@
+# Parameter files containing sensitive values
+*.bicepparam
+*.parameters.json
+
+# ARM template exports (may contain subscription details)
+*.json
+
+# Azure CLI artifacts
+.azure/
+
+# Deployment output files
+deployment-output*.txt
+deployment-output*.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
