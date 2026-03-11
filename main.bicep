@@ -53,7 +53,8 @@ param publicNetworkAccess string = 'Disabled'
 param workspaceSku string = 'premium'
 
 @description('Databricks container name')
-param containerName string = 'databricks'
+param containerName string
+
 var managedResourceGroupName = '${databricksName}-managed-rg'
 
 resource vnet 'Microsoft.Network/virtualNetworks@2023-09-01' existing = {
