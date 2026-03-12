@@ -27,8 +27,20 @@ param customPublicSubnetName string
 @description('Private Subnet Name')
 param customPrivateSubnetName string
 
-@description('Private Endpoint Subnet ID')
-param privateEndpointSubnetId string
+@description('Key Vault URI')
+param keyVaultUri string
+
+@description('Managed Services CMK key name')
+param managedServicesKeyName string
+
+@description('Managed Services CMK key version')
+param managedServicesKeyVersion string
+
+@description('Managed Disk CMK key name')
+param managedDiskKeyName string
+
+@description('Managed Disk CMK key version')
+param managedDiskKeyVersion string
 
 @description('Controls public network access to Databricks workspace')
 @allowed([
@@ -57,6 +69,28 @@ resource workspace 'Microsoft.Databricks/workspaces@2024-05-01' = {
       identityType: 'SystemAssigned'
     }
 
+    encryption: {
+      entities: {
+        managedServices: {
+          keySource: 'Microsoft.Keyvault'
+          keyVaultProperties: {
+            keyName: managedServicesKeyName
+            keyVaultUri: keyVaultUri
+            keyVersion: managedServicesKeyVersion
+          }
+        }
+        managedDisk: {
+          keySource: 'Microsoft.Keyvault'
+          keyVaultProperties: {
+            keyName: managedDiskKeyName
+            keyVaultUri: keyVaultUri
+            keyVersion: managedDiskKeyVersion
+          }
+          rotationToLatestKeyVersionEnabled: true
+        }
+      }
+    }
+
     parameters: {
       customVirtualNetworkId: {
         value: customVirtualNetworkId
@@ -81,28 +115,6 @@ resource workspace 'Microsoft.Databricks/workspaces@2024-05-01' = {
     publicNetworkAccess: publicNetworkAccess
     requiredNsgRules: publicNetworkAccess == 'Disabled' ? 'NoAzureDatabricksRules' : 'AllRules'
 
-  }
-}
-
-
-resource privateEndpoint 'Microsoft.Network/privateEndpoints@2023-09-01' = {
-  name: '${name}-pe'
-  location: location
-  properties: {
-    subnet: {
-      id: privateEndpointSubnetId
-    }
-    privateLinkServiceConnections: [
-      {
-        name: 'databricks-ui'
-        properties: {
-          privateLinkServiceId: workspace.id
-          groupIds: [
-            'databricks_ui_api'
-          ]
-        }
-      }
-    ]
   }
 }
 

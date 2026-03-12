@@ -1,5 +1,6 @@
 targetScope = 'resourceGroup'
 
+
 @description('Location for all resources')
 param location string = resourceGroup().location
 
@@ -39,6 +40,9 @@ param storageAccountName string
 @description('Storage CMK key name')
 param storageKeyName string
 
+@description('Container name for Databricks data')
+param containerName string = 'databricks'
+
 @description('Controls public network access to Databricks workspace')
 @allowed([
   'Enabled'
@@ -52,10 +56,9 @@ param publicNetworkAccess string = 'Disabled'
 ])
 param workspaceSku string = 'premium'
 
-@description('Databricks container name')
-param containerName string
 
 var managedResourceGroupName = '${databricksName}-managed-rg'
+
 
 resource vnet 'Microsoft.Network/virtualNetworks@2023-09-01' existing = {
   name: vnetName
@@ -81,6 +84,12 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-02-01' = {
     enableRbacAuthorization: true
   }
 }
+
+// ============================================================
+// FOUNDATION - CMK KEYS
+// Three separate keys for managed services, managed disk
+// and storage account encryption
+// ============================================================
 
 resource managedServicesKey 'Microsoft.KeyVault/vaults/keys@2023-02-01' = {
   parent: keyVault
@@ -133,75 +142,17 @@ resource storageKey 'Microsoft.KeyVault/vaults/keys@2023-02-01' = {
   }
 }
 
+// Extract key versions from the key URIs
+// Format: https://<vault>.vault.azure.net/keys/<n>/<version>
 var managedServicesKeyVersion = last(split(managedServicesKey.properties.keyUriWithVersion, '/'))
 var managedDiskKeyVersion = last(split(managedDiskKey.properties.keyUriWithVersion, '/'))
 var storageKeyVersion = last(split(storageKey.properties.keyUriWithVersion, '/'))
 
-resource databricksNsg 'Microsoft.Network/networkSecurityGroups@2023-09-01' = {
-  name: '${databricksName}-nsg'
-  location: location
-  properties: {
-    securityRules: [
-      {
-        name: 'databricks-worker-to-databricks-webapp'
-        properties: {
-          priority: 100
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Outbound'
-          sourceAddressPrefix: 'VirtualNetwork'
-          sourcePortRange: '*'
-          destinationAddressPrefix: 'AzureDatabricks'
-          destinationPortRanges: [
-            '443'
-            '3306'
-            '8443-8451'
-          ]
-        }
-      }
-      {
-        name: 'databricks-worker-to-sql'
-        properties: {
-          priority: 110
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Outbound'
-          sourceAddressPrefix: 'VirtualNetwork'
-          sourcePortRange: '*'
-          destinationAddressPrefix: 'Sql'
-          destinationPortRange: '3306'
-        }
-      }
-      {
-        name: 'databricks-worker-to-storage'
-        properties: {
-          priority: 120
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Outbound'
-          sourceAddressPrefix: 'VirtualNetwork'
-          sourcePortRange: '*'
-          destinationAddressPrefix: 'Storage'
-          destinationPortRange: '443'
-        }
-      }
-      {
-        name: 'databricks-worker-to-eventhub'
-        properties: {
-          priority: 130
-          protocol: 'Tcp'
-          access: 'Allow'
-          direction: 'Outbound'
-          sourceAddressPrefix: 'VirtualNetwork'
-          sourcePortRange: '*'
-          destinationAddressPrefix: 'EventHub'
-          destinationPortRange: '9093'
-        }
-      }
-    ]
-  }
-}
-
+// ============================================================
+// FOUNDATION - ACCESS CONNECTOR
+// Provides a managed identity for Databricks to authenticate
+// to Key Vault and Storage without storing credentials
+// ============================================================
 
 module accessConnector './modules/accessConnector.bicep' = {
   name: 'deploy-access-connector'
@@ -210,6 +161,13 @@ module accessConnector './modules/accessConnector.bicep' = {
     location: location
   }
 }
+
+// ============================================================
+// FOUNDATION - KEY VAULT ROLE ASSIGNMENT
+// Grants the Access Connector identity the
+// 'Key Vault Crypto Service Encryption User' role
+// so it can wrap/unwrap CMK keys for encryption
+// ============================================================
 
 resource keyVaultRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(keyVault.id, accessConnectorName, 'kv-encryption-role')
@@ -227,6 +185,10 @@ resource keyVaultRoleAssignment 'Microsoft.Authorization/roleAssignments@2022-04
   ]
 }
 
+// ============================================================
+// STAGE 1 - DATABRICKS WORKSPACE (no CMK)
+// ============================================================
+
 module databricks './modules/databricks.bicep' = {
   name: 'deploy-databricks'
   params: {
@@ -238,12 +200,7 @@ module databricks './modules/databricks.bicep' = {
     customVirtualNetworkId: vnet.id
     customPublicSubnetName: publicSubnetName
     customPrivateSubnetName: privateSubnetName
-    existingKeyVaultName: keyVault.name
-    keyVaultResourceGroup: resourceGroup().name
-    managedServicesKeyName: managedServicesKeyName
-    managedServicesKeyVersion: managedServicesKeyVersion
-    managedDiskKeyName: managedDiskKeyName
-    managedDiskKeyVersion: managedDiskKeyVersion
+    privateEndpointSubnetId: privateEndpointSubnet.id
     publicNetworkAccess: publicNetworkAccess
   }
   dependsOn: [
@@ -252,29 +209,38 @@ module databricks './modules/databricks.bicep' = {
   ]
 }
 
-resource databricksPrivateEndpoint 'Microsoft.Network/privateEndpoints@2023-09-01' = {
-  name: '${databricksName}-pe'
-  location: location
-  properties: {
-    subnet: {
-      id: privateEndpointSubnet.id
-    }
-    privateLinkServiceConnections: [
-      {
-        name: 'databricks-ui'
-        properties: {
-          privateLinkServiceId: databricks.outputs.workspaceId
-          groupIds: [
-            'databricks_ui_api'
-          ]
-        }
-      }
-    ]
+// ============================================================
+// STAGE 2 - DATABRICKS ENCRYPTION
+// ============================================================
+
+module databricksEncryption './modules/databricksEncryption.bicep' = {
+  name: 'deploy-databricks-encryption'
+  params: {
+    name: databricksName
+    location: location
+    sku: workspaceSku
+    accessConnectorId: accessConnector.outputs.id
+    managedResourceGroupName: managedResourceGroupName
+    customVirtualNetworkId: vnet.id
+    customPublicSubnetName: publicSubnetName
+    customPrivateSubnetName: privateSubnetName
+    keyVaultUri: keyVault.properties.vaultUri
+    managedServicesKeyName: managedServicesKeyName
+    managedServicesKeyVersion: managedServicesKeyVersion
+    managedDiskKeyName: managedDiskKeyName
+    managedDiskKeyVersion: managedDiskKeyVersion
+    publicNetworkAccess: publicNetworkAccess
   }
   dependsOn: [
     databricks
   ]
 }
+
+// ============================================================
+// STAGE 3 - ADLS GEN2 STORAGE ACCOUNT
+// Deploys storage with CMK encryption, private endpoint
+// and grants Access Connector blob data contributor access
+// ============================================================
 
 module storage './modules/storage.bicep' = {
   name: 'deploy-storage'
@@ -290,11 +256,16 @@ module storage './modules/storage.bicep' = {
   }
   dependsOn: [
     keyVaultRoleAssignment
-    databricks
+    databricksEncryption
   ]
 }
 
-output databricksWorkspace string = databricksName
+// ============================================================
+// OUTPUTS
+// ============================================================
+
+output databricksWorkspaceId string = databricks.outputs.workspaceId
+output databricksWorkspaceUrl string = databricks.outputs.workspaceUrl
 output accessConnectorPrincipalId string = accessConnector.outputs.principalId
 output keyVaultUri string = keyVault.properties.vaultUri
 output storageAccountName string = storage.outputs.storageAccountName
