@@ -1,0 +1,58 @@
+// =============================================
+// Post-deployment CMK Permission Grants (Merged into one policy)
+// =============================================
+
+param databricksName string
+param databricksManagedResourceGroupName string
+param databricksKeyVaultName string
+
+// Reference the existing workspace
+resource workspace 'Microsoft.Databricks/workspaces@2024-05-01' existing = {
+  name: databricksName
+}
+
+// Reference the existing Key Vault
+resource existingKeyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
+  name: databricksKeyVaultName
+}
+
+// Reference the Disk Encryption Set (for Managed Disks)
+resource diskEncryptionSet 'Microsoft.Compute/diskEncryptionSets@2024-03-02' existing = {
+  name: 'dbdiskencryptionset${uniqueString(databricksName)}'   // Update with exact name from portal if needed
+  scope: resourceGroup(databricksManagedResourceGroupName)
+}
+
+// SINGLE merged access policy for ALL required identities
+resource cmkKeyVaultPolicy 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
+  parent: existingKeyVault
+  name: 'cmkPolicy'   // unique name
+  dependsOn: [ workspace, diskEncryptionSet ]
+  properties: {
+    accessPolicies: [
+      // 1. Storage Account Identity (fixes DBFS Root / storage account error)
+      {
+        tenantId: subscription().tenantId
+        objectId: workspace.properties.storageAccountIdentity.principalId
+        permissions: {
+          keys: [ 'get', 'wrapKey', 'unwrapKey', 'list', 'decrypt' ]
+        }
+      },
+      // 2. Disk Encryption Set Identity (Managed Disks)
+      {
+        tenantId: subscription().tenantId
+        objectId: diskEncryptionSet.identity.principalId
+        permissions: {
+          keys: [ 'get', 'wrapKey', 'unwrapKey' ]
+        }
+      },
+      // 3. Workspace System Identity (Managed Services)
+      {
+        tenantId: subscription().tenantId
+        objectId: workspace.identity.principalId
+        permissions: {
+          keys: [ 'get', 'wrapKey', 'unwrapKey' ]
+        }
+      }
+    ]
+  }
+}
