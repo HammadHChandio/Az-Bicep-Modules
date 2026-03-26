@@ -1,0 +1,77 @@
+// =============================================
+// Post-deployment CMK Permission Grants
+// This file should ONLY grant permissions — do NOT redefine the workspace
+// =============================================
+
+param databricksName string
+param databricksManagedResourceGroupName string
+param databricksKeyVaultName string
+
+// Reference the existing workspace
+resource workspace 'Microsoft.Databricks/workspaces@2024-05-01' existing = {
+  name: databricksName
+}
+
+// Reference the existing Key Vault
+resource existingKeyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
+  name: databricksKeyVaultName
+}
+
+// 1. Storage Account Identity (fixes the storage account authentication error for DBFS Root)
+resource storageAccountKvPolicy 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
+  parent: existingKeyVault
+  name: 'add'
+  dependsOn: [ workspace ]
+  properties: {
+    accessPolicies: [
+      {
+        tenantId: subscription().tenantId
+        objectId: workspace.properties.storageAccountIdentity.principalId
+        permissions: {
+          keys: [ 'get', 'wrapKey', 'unwrapKey', 'list', 'decrypt' ]
+        }
+      }
+    ]
+  }
+}
+
+// 2. Disk Encryption Set for Managed Disks CMK
+resource diskEncryptionSet 'Microsoft.Compute/diskEncryptionSets@2024-03-02' existing = {
+  name: 'dbdiskencryptionset${uniqueString(databricksName)}'   // Change to exact name from portal if it fails
+  scope: resourceGroup(databricksManagedResourceGroupName)
+}
+
+resource desKeyVaultPolicy 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
+  parent: existingKeyVault
+  name: 'add'
+  dependsOn: [ workspace, diskEncryptionSet ]
+  properties: {
+    accessPolicies: [
+      {
+        tenantId: subscription().tenantId
+        objectId: diskEncryptionSet.identity.principalId
+        permissions: {
+          keys: [ 'get', 'wrapKey', 'unwrapKey' ]
+        }
+      }
+    ]
+  }
+}
+
+// 3. Workspace System Identity for Managed Services CMK
+resource managedServicesKvPolicy 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
+  parent: existingKeyVault
+  name: 'add'
+  dependsOn: [ workspace ]
+  properties: {
+    accessPolicies: [
+      {
+        tenantId: subscription().tenantId
+        objectId: workspace.identity.principalId
+        permissions: {
+          keys: [ 'get', 'wrapKey', 'unwrapKey' ]
+        }
+      }
+    ]
+  }
+}
