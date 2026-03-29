@@ -1,0 +1,384 @@
+// ============================================
+// PARAMETERS
+// ============================================
+
+param location string
+param databricksName string
+param databricksSku string
+param databricksManagedResourceGroupName string
+param databricksAccessConnectorId string
+param databricksCustomVirtualNetworkId string
+param databricksCustomPublicSubnetName string
+param databricksCustomPrivateSubnetName string
+param databricksExistingKeyvaultName string
+param databricksKeyVaultUri string
+
+@description('Managed Services CMK key name')
+param databricksManagedServicesKeyName string
+
+@description('Managed Services CMK key version')
+param databricksManagedServicesKeyVersion string
+
+@description('Managed Disk CMK key name')
+param databricksManagedDiskKeyName string
+
+@description('Managed Disk CMK key version')
+param databricksManagedDiskKeyVersion string
+
+param databricksDbfsRootKeyName string
+param databricksDbfsRootKeyVersion string
+
+@description('Controls public network access to Databricks workspace')
+@allowed([
+  'Enabled'
+  'Disabled'
+])
+param databricksPublicNetworkAccess string = 'Disabled'
+
+// ============================================
+// EXISTING RESOURCES
+// ============================================
+
+resource existingKeyvault 'Microsoft.KeyVault/vaults@2025-05-01' existing = {
+  name: databricksExistingKeyvaultName
+}
+
+// Reference the existing workspace
+resource workspace 'Microsoft.Databricks/workspaces@2024-05-01' existing = {
+  name: databricksName
+}
+
+// ============================================
+// KEY VAULT ACCESS POLICIES
+// ============================================
+
+resource databricksKvPolicy 'Microsoft.KeyVault/vaults/accessPolicies@2023-07-01' = {
+  parent: existingKeyvault
+  name: 'add'
+  properties: {
+    accessPolicies: [
+      {
+        // Policy 1 - hardcoded object ID (your MSI or app)
+        tenantId: subscription().tenantId
+        objectId: 'e6ee2b39-3925-4300-ad3d-7c7a64f40e9c'
+        permissions: {
+          keys: [
+            'unwrapKey'
+            'wrapKey'
+            'get'
+            'list'
+            'decrypt'
+          ]
+        }
+      }
+      {
+        // Policy 2 - Managed Disk Identity
+        tenantId: subscription().tenantId
+        objectId: workspaceManageDiskIdentity.properties.managedDiskIdentity.principalId
+        permissions: {
+          keys: [
+            'unwrapKey'
+            'wrapKey'
+            'get'
+            'list'
+            'decrypt'
+          ]
+        }
+      }
+      {
+        // Policy 3 - Storage Account Identity
+        tenantId: subscription().tenantId
+        objectId: workspaceManageDiskIdentity.properties.storageAccountIdentity.principalId
+        permissions: {
+          keys: [
+            'unwrapKey'
+            'wrapKey'
+            'get'
+            'list'
+            'decrypt'
+          ]
+        }
+      }
+    ]
+  }
+}
+
+// ============================================
+// STAGE 1 - DATABRICKS WORKSPACE ENCRYPTION
+// (DBFS Root - prepareEncryption first)
+// ============================================
+
+resource workspaceEncryption 'Microsoft.Databricks/workspaces@2024-05-01' = {
+  name: workspace.name
+  location: location
+  sku: {
+    name: databricksSku
+  }
+  properties: {
+    defaultStorageFirewall: 'Enabled'
+    managedResourceGroupId: subscriptionResourceId(
+      'Microsoft.Resources/resourceGroups',
+      databricksManagedResourceGroupName
+    )
+    managedDiskIdentity: {}
+    accessConnector: {
+      id: databricksAccessConnectorId
+      identityType: 'SystemAssigned'
+    }
+
+    enhancedSecurityCompliance: {
+      automaticClusterUpdate: {
+        value: 'Disabled'
+      }
+      complianceSecurityProfile: {
+        complianceStandards: []
+        value: 'Disabled'
+      }
+      enhancedSecurityMonitoring: {
+        value: 'Enabled'
+      }
+    }
+
+    parameters: {
+      customVirtualNetworkId: {
+        value: databricksCustomVirtualNetworkId
+      }
+      customPublicSubnetName: {
+        value: databricksCustomPublicSubnetName
+      }
+      customPrivateSubnetName: {
+        value: databricksCustomPrivateSubnetName
+      }
+      enableNoPublicIp: {
+        value: true
+      }
+      // CRITICAL - must be true in stage 1
+      prepareEncryption: {
+        value: true
+      }
+      requireInfrastructureEncryption: {
+        value: false
+      }
+      // DBFS root encryption - must always be present
+      encryption: {
+        value: {
+          keySource: 'Microsoft.Keyvault'
+          KeyName: databricksDbfsRootKeyName
+          keyvaulturi: databricksKeyVaultUri
+          keyversion: databricksDbfsRootKeyVersion
+        }
+      }
+    }
+
+    publicNetworkAccess: databricksPublicNetworkAccess
+    requiredNsgRules: databricksPublicNetworkAccess == 'Disabled'
+      ? 'NoAzureDatabricksRules'
+      : 'AllRules'
+    storageAccountIdentity: {}
+  }
+  dependsOn: [
+    databricksKvPolicy
+  ]
+}
+
+// ============================================
+// STAGE 2 - ADD MANAGED DISK IDENTITY
+// ============================================
+
+resource workspaceManageDiskIdentity 'Microsoft.Databricks/workspaces@2024-05-01' = {
+  name: workspace.name
+  location: location
+  sku: {
+    name: databricksSku
+  }
+  properties: {
+    defaultStorageFirewall: 'Enabled'
+    managedResourceGroupId: subscriptionResourceId(
+      'Microsoft.Resources/resourceGroups',
+      databricksManagedResourceGroupName
+    )
+    // Empty object triggers Azure to generate the identity
+    managedDiskIdentity: {}
+    accessConnector: {
+      id: databricksAccessConnectorId
+      identityType: 'SystemAssigned'
+    }
+
+    // CRITICAL - re-supply encryption every update
+    encryption: {
+      entities: {
+        managedServices: {
+          keySource: 'Microsoft.Keyvault'
+          keyVaultProperties: {
+            keyName: databricksManagedServicesKeyName
+            keyVaultUri: databricksKeyVaultUri
+            keyVersion: databricksManagedServicesKeyVersion
+          }
+        }
+      }
+    }
+
+    enhancedSecurityCompliance: {
+      automaticClusterUpdate: {
+        value: 'Disabled'
+      }
+      complianceSecurityProfile: {
+        complianceStandards: []
+        value: 'Disabled'
+      }
+      enhancedSecurityMonitoring: {
+        value: 'Enabled'
+      }
+    }
+
+    parameters: {
+      customVirtualNetworkId: {
+        value: databricksCustomVirtualNetworkId
+      }
+      customPublicSubnetName: {
+        value: databricksCustomPublicSubnetName
+      }
+      customPrivateSubnetName: {
+        value: databricksCustomPrivateSubnetName
+      }
+      enableNoPublicIp: {
+        value: true
+      }
+      prepareEncryption: {
+        value: true
+      }
+      requireInfrastructureEncryption: {
+        value: false
+      }
+      // CRITICAL - must re-supply DBFS encryption here too
+      encryption: {
+        value: {
+          keySource: 'Microsoft.Keyvault'
+          KeyName: databricksDbfsRootKeyName
+          keyvaulturi: databricksKeyVaultUri
+          keyversion: databricksDbfsRootKeyVersion
+        }
+      }
+    }
+
+    publicNetworkAccess: databricksPublicNetworkAccess
+    requiredNsgRules: databricksPublicNetworkAccess == 'Disabled'
+      ? 'NoAzureDatabricksRules'
+      : 'AllRules'
+    storageAccountIdentity: {}
+  }
+  dependsOn: [
+    workspaceEncryption
+    databricksKvPolicy
+  ]
+}
+
+// ============================================
+// STAGE 3 - ADD MANAGED DISK ENCRYPTION
+// ============================================
+
+resource workspaceManageDiskEncryption 'Microsoft.Databricks/workspaces@2024-05-01' = {
+  name: workspace.name
+  location: location
+  sku: {
+    name: databricksSku
+  }
+  properties: {
+    defaultStorageFirewall: 'Enabled'
+    managedResourceGroupId: subscriptionResourceId(
+      'Microsoft.Resources/resourceGroups',
+      databricksManagedResourceGroupName
+    )
+    managedDiskIdentity: {}
+    accessConnector: {
+      id: databricksAccessConnectorId
+      identityType: 'SystemAssigned'
+    }
+
+    // CRITICAL - must have ALL encryption entities here
+    encryption: {
+      entities: {
+        managedServices: {
+          keySource: 'Microsoft.Keyvault'
+          keyVaultProperties: {
+            keyName: databricksManagedServicesKeyName
+            keyVaultUri: databricksKeyVaultUri
+            keyVersion: databricksManagedServicesKeyVersion
+          }
+        }
+        managedDisk: {
+          keySource: 'Microsoft.Keyvault'
+          keyVaultProperties: {
+            keyName: databricksManagedDiskKeyName
+            keyVaultUri: databricksKeyVaultUri
+            keyVersion: databricksManagedDiskKeyVersion
+          }
+          rotationToLatestKeyVersionEnabled: false
+        }
+      }
+    }
+
+    enhancedSecurityCompliance: {
+      automaticClusterUpdate: {
+        value: 'Disabled'
+      }
+      complianceSecurityProfile: {
+        complianceStandards: []
+        value: 'Disabled'
+      }
+      enhancedSecurityMonitoring: {
+        value: 'Enabled'
+      }
+    }
+
+    parameters: {
+      customVirtualNetworkId: {
+        value: databricksCustomVirtualNetworkId
+      }
+      customPublicSubnetName: {
+        value: databricksCustomPublicSubnetName
+      }
+      customPrivateSubnetName: {
+        value: databricksCustomPrivateSubnetName
+      }
+      enableNoPublicIp: {
+        value: true
+      }
+      prepareEncryption: {
+        value: true
+      }
+      requireInfrastructureEncryption: {
+        value: false
+      }
+      // CRITICAL - must re-supply DBFS encryption in every update
+      encryption: {
+        value: {
+          keySource: 'Microsoft.Keyvault'
+          KeyName: databricksDbfsRootKeyName
+          keyvaulturi: databricksKeyVaultUri
+          keyversion: databricksDbfsRootKeyVersion
+        }
+      }
+    }
+
+    publicNetworkAccess: databricksPublicNetworkAccess
+    requiredNsgRules: databricksPublicNetworkAccess == 'Disabled'
+      ? 'NoAzureDatabricksRules'
+      : 'AllRules'
+    storageAccountIdentity: {}
+  }
+  dependsOn: [
+    workspaceEncryption
+    workspaceManageDiskIdentity
+    databricksKvPolicy
+  ]
+}
+
+// ============================================
+// OUTPUTS
+// ============================================
+
+output workspaceId string = workspace.id
+output workspaceName string = workspace.name
+output workspaceUrl string = workspace.properties.workspaceUrl
+output managedDiskIdentityPrincipalId string = workspaceManageDiskIdentity.properties.managedDiskIdentity.principalId
